@@ -54,8 +54,13 @@ uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
      * fence method runs under pg->lock, and guest MMIO writes to this
      * register are issued by the same single vCPU that polls it.
      */
-    if (addr == NV_PGRAPH_PATT_COLOR0 && size == 4) {
-        uint64_t fr = qatomic_read(&pg->regs_[NV_PGRAPH_PATT_COLOR0]);
+    /*
+     * NV_PGRAPH_INCREMENT is likewise read (once per frame, from the flip
+     * path) but never written by the FIFO side, so it needs no lock either.
+     */
+    if ((addr == NV_PGRAPH_PATT_COLOR0 || addr == NV_PGRAPH_INCREMENT) &&
+        size == 4) {
+        uint64_t fr = qatomic_read(&pg->regs_[addr]);
         /*
          * Pairs with the smp_wmb at the fence write site in pgraph_method,
          * so that the pgraph effects preceding the fence are visible once
@@ -66,6 +71,14 @@ uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
         return fr;
     }
 
+    /*
+     * Take the FIFO lock first, as pgraph_write does. The puller drops it
+     * while running a method and must retake it before the next one, so a
+     * waiting vCPU is served at the next method boundary. With only
+     * pg->lock, the puller's unlock/relock between methods usually wins the
+     * race and the vCPU can sit out many methods (>1 ms per read).
+     */
+    qemu_mutex_lock(&d->pfifo.lock);
     qemu_mutex_lock(&pg->lock);
 
     uint64_t r = 0;
@@ -97,6 +110,7 @@ uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
     }
 
     qemu_mutex_unlock(&pg->lock);
+    qemu_mutex_unlock(&d->pfifo.lock);
 
     nv2a_reg_log_read(NV_PGRAPH, addr, size, r);
     return r;
