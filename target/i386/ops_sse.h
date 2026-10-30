@@ -493,36 +493,57 @@ void glue(helper_pshufhw, SUFFIX)(Reg *d, Reg *s, int order)
  * over. The asm keeps the op between the MXCSR switches, which the
  * compiler would otherwise be free to reorder.
  */
-static inline void sse_native_raise(CPUX86State *env, uint32_t f)
+static inline uint32_t sse_native_flags_to_sf(uint32_t f)
 {
-    if (f & 0x3f) {
-        float_raise((f & FPUS_IE ? float_flag_invalid : 0) |
-                    (f & FPUS_DE ? float_flag_input_denormal_used : 0) |
-                    (f & FPUS_ZE ? float_flag_divbyzero : 0) |
-                    (f & FPUS_OE ? float_flag_overflow : 0) |
-                    (f & FPUS_UE ? float_flag_underflow : 0) |
-                    (f & FPUS_PE ? float_flag_inexact : 0),
-                    &env->sse_status);
-    }
+    return (f & FPUS_IE ? float_flag_invalid : 0) |
+           (f & FPUS_DE ? float_flag_input_denormal_used : 0) |
+           (f & FPUS_ZE ? float_flag_divbyzero : 0) |
+           (f & FPUS_OE ? float_flag_overflow : 0) |
+           (f & FPUS_UE ? float_flag_underflow : 0) |
+           (f & FPUS_PE ? float_flag_inexact : 0);
 }
+
+/*
+ * LDMXCSR is microcoded and partially serializing, so avoid it in the common
+ * case: when the guest control bits equal the host default (round nearest,
+ * no FTZ/DAZ, all masked), run the op directly and read the host flags. If
+ * every flag set on the host is already set for the guest the guest state
+ * cannot change; otherwise clear the host flags and redo the op to get its
+ * exact flags.
+ */
+#define SSE_NATIVE_DEFAULT_CSR 0x1f80
 
 #define SSE_NATIVE_OP(insn, d, v, s)                                    \
     do {                                                                \
         uint32_t ctrl_ = (env->mxcsr & (SSE_RC_MASK | SSE_FZ | SSE_DAZ)) \
-                         | 0x1f80;                                      \
-        uint32_t host_ = 0, flags_;                                     \
-        __m128 a_ = _mm_loadu_ps((const float *)&(v)->ZMM_S(0));        \
+                         | SSE_NATIVE_DEFAULT_CSR;                      \
+        uint32_t host_ = SSE_NATIVE_DEFAULT_CSR, flags_;                \
         __m128 b_ = _mm_loadu_ps((const float *)&(s)->ZMM_S(0));        \
+        __m128 a_ = _mm_loadu_ps((const float *)&(v)->ZMM_S(0));        \
+        __m128 r_ = a_;                                                 \
+        if (likely(ctrl_ == SSE_NATIVE_DEFAULT_CSR)) {                  \
+            asm volatile(insn " %[b], %[a]\n\t"                         \
+                         "stmxcsr %[flags]"                             \
+                         : [a] "+x"(r_), [flags] "=m"(flags_)           \
+                         : [b] "x"(b_));                                \
+            uint32_t sf_ = sse_native_flags_to_sf(flags_);              \
+            if (likely(!(sf_ & ~get_float_exception_flags(              \
+                                    &env->sse_status)))) {              \
+                _mm_storeu_ps((float *)&(d)->ZMM_S(0), r_);             \
+                break;                                                  \
+            }                                                           \
+            r_ = a_;                                                    \
+        }                                                               \
         asm volatile("stmxcsr %[host]\n\t"                              \
                      "ldmxcsr %[ctrl]\n\t"                              \
                      insn " %[b], %[a]\n\t"                             \
                      "stmxcsr %[flags]\n\t"                             \
                      "ldmxcsr %[host]"                                  \
-                     : [a] "+x"(a_), [host] "+m"(host_),                \
+                     : [a] "+x"(r_), [host] "+m"(host_),                \
                        [flags] "=m"(flags_)                             \
                      : [b] "x"(b_), [ctrl] "m"(ctrl_));                 \
-        _mm_storeu_ps((float *)&(d)->ZMM_S(0), a_);                     \
-        sse_native_raise(env, flags_);                                  \
+        _mm_storeu_ps((float *)&(d)->ZMM_S(0), r_);                     \
+        float_raise(sse_native_flags_to_sf(flags_), &env->sse_status);  \
     } while (0)
 
 #define SSE_NATIVE_ENABLED() (g_config.perf.hard_fpu)

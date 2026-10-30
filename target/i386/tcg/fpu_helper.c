@@ -3572,7 +3572,7 @@ static void __attribute__((constructor)) sse_native_selftest(void)
                 uint32_t mx[2];
                 for (int m = 0; m < 2; m++) {
                     g_config.perf.hard_fpu = m;
-                    env->mxcsr = ctrls[c];
+                    env->mxcsr = ctrls[c] | ((it * 7) & 0x3f);
                     update_mxcsr_status(env);
                     ops[o].f(env, m ? &d2 : &d1, &v, &s);
                     update_mxcsr_from_sse_status(env);
