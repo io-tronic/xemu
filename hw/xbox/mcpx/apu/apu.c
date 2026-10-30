@@ -337,7 +337,14 @@ static void mcpx_apu_reset_hold(Object *obj, ResetType type)
     qemu_mutex_lock(&d->lock);
     mcpx_apu_wait_for_idle(d);
     mcpx_apu_reset_locked(d);
-    mcpx_apu_resume(d);
+    /*
+     * A reset while the VM is stopped (e.g. the one load_snapshot performs
+     * before restoring state) must leave the frame thread paused; the VM
+     * state change handler resumes it once DSP state is synced from the VM.
+     */
+    if (runstate_is_running()) {
+        mcpx_apu_resume(d);
+    }
     qemu_mutex_unlock(&d->lock);
     bql_lock();
 }
