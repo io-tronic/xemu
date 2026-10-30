@@ -484,12 +484,83 @@ void glue(helper_pshufhw, SUFFIX)(Reg *d, Reg *s, int order)
 
 #if SHIFT == 1
 
+#if defined(XBOX) && defined(__x86_64__)
+/*
+ * The host is x86 too, so SSE single-precision arithmetic can run natively
+ * with bit-identical results (rounding, NaN propagation, DAZ/FTZ) by
+ * executing it under the guest's MXCSR control bits. Host exceptions stay
+ * masked; QEMU never delivers #XM, so only the sticky flags need carrying
+ * over. The asm keeps the op between the MXCSR switches, which the
+ * compiler would otherwise be free to reorder.
+ */
+static inline void sse_native_raise(CPUX86State *env, uint32_t f)
+{
+    if (f & 0x3f) {
+        float_raise((f & FPUS_IE ? float_flag_invalid : 0) |
+                    (f & FPUS_DE ? float_flag_input_denormal_used : 0) |
+                    (f & FPUS_ZE ? float_flag_divbyzero : 0) |
+                    (f & FPUS_OE ? float_flag_overflow : 0) |
+                    (f & FPUS_UE ? float_flag_underflow : 0) |
+                    (f & FPUS_PE ? float_flag_inexact : 0),
+                    &env->sse_status);
+    }
+}
+
+#define SSE_NATIVE_OP(insn, d, v, s)                                    \
+    do {                                                                \
+        uint32_t ctrl_ = (env->mxcsr & (SSE_RC_MASK | SSE_FZ | SSE_DAZ)) \
+                         | 0x1f80;                                      \
+        uint32_t host_ = 0, flags_;                                     \
+        __m128 a_ = _mm_loadu_ps((const float *)&(v)->ZMM_S(0));        \
+        __m128 b_ = _mm_loadu_ps((const float *)&(s)->ZMM_S(0));        \
+        asm volatile("stmxcsr %[host]\n\t"                              \
+                     "ldmxcsr %[ctrl]\n\t"                              \
+                     insn " %[b], %[a]\n\t"                             \
+                     "stmxcsr %[flags]\n\t"                             \
+                     "ldmxcsr %[host]"                                  \
+                     : [a] "+x"(a_), [host] "+m"(host_),                \
+                       [flags] "=m"(flags_)                             \
+                     : [b] "x"(b_), [ctrl] "m"(ctrl_));                 \
+        _mm_storeu_ps((float *)&(d)->ZMM_S(0), a_);                     \
+        sse_native_raise(env, flags_);                                  \
+    } while (0)
+
+#define SSE_NATIVE_ENABLED() (g_config.perf.hard_fpu)
+#else
+#define SSE_NATIVE_OP(insn, d, v, s) g_assert_not_reached()
+#define SSE_NATIVE_ENABLED() (false)
+#endif
+
 #define SSE_HELPER_S(name, F)                                           \
-    SSE_HELPER_P(name, F)                                               \
+    void glue(helper_ ## name ## ps, SUFFIX)(CPUX86State *env,          \
+            Reg *d, Reg *v, Reg *s)                                     \
+    {                                                                   \
+        int i;                                                          \
+        if (SSE_NATIVE_ENABLED()) {                                     \
+            SSE_NATIVE_OP(#name "ps", d, v, s);                         \
+            return;                                                     \
+        }                                                               \
+        for (i = 0; i < 2 << SHIFT; i++) {                              \
+            d->ZMM_S(i) = F(32, v->ZMM_S(i), s->ZMM_S(i));              \
+        }                                                               \
+    }                                                                   \
+                                                                        \
+    void glue(helper_ ## name ## pd, SUFFIX)(CPUX86State *env,          \
+            Reg *d, Reg *v, Reg *s)                                     \
+    {                                                                   \
+        int i;                                                          \
+        for (i = 0; i < 1 << SHIFT; i++) {                              \
+            d->ZMM_D(i) = F(64, v->ZMM_D(i), s->ZMM_D(i));              \
+        }                                                               \
+    }                                                                   \
                                                                         \
     void helper_ ## name ## ss(CPUX86State *env, Reg *d, Reg *v, Reg *s)\
     {                                                                   \
         int i;                                                          \
+        if (SSE_NATIVE_ENABLED()) {                                     \
+            SSE_NATIVE_OP(#name "ss", d, v, s);                         \
+            return;                                                     \
+        }                                                               \
         d->ZMM_S(0) = F(32, v->ZMM_S(0), s->ZMM_S(0));                  \
         for (i = 1; i < 2 << SHIFT; i++) {                              \
             d->ZMM_L(i) = v->ZMM_L(i);                                  \

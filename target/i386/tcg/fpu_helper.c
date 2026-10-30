@@ -28,6 +28,10 @@
 #include "fpu/softfloat-macros.h"
 #include "helper-tcg.h"
 #include "access.h"
+#if defined(XBOX) && defined(__x86_64__)
+#include <immintrin.h>
+#include "ui/xemu-settings.h"
+#endif
 
 /* float macros */
 #define FT0    (env->ft0)
@@ -3515,4 +3519,104 @@ void helper_emms(CPUX86State *env)
 #define SHIFT 2
 #include "ops_sse.h"
 
+#endif
+
+#if defined(XBOX) && defined(__x86_64__)
+/* molly-perf: XEMU_SSE_SELFTEST=1 compares native SSE helpers to softfloat */
+static uint32_t selftest_rand_f32(uint64_t *st)
+{
+    *st ^= *st << 13; *st ^= *st >> 7; *st ^= *st << 17;
+    uint32_t r = *st;
+    static const uint32_t special[] = {
+        0x00000000, 0x80000000, 0x7f800000, 0xff800000, 0x7fc00000,
+        0xffc00000, 0x7f800001, 0x7fa00000, 0x00000001, 0x807fffff,
+        0x00800000, 0x7f7fffff, 0x3f800000, 0x0000ffff,
+    };
+    switch ((*st >> 40) & 7) {
+    case 0: return special[(*st >> 44) % ARRAY_SIZE(special)];
+    case 1: return r & 0x80ffffff;              /* tiny / denormal */
+    case 2: return (r & 0x80ffffff) | 0x7e000000; /* huge */
+    default: return r;
+    }
+}
+
+static void __attribute__((constructor)) sse_native_selftest(void)
+{
+    if (!getenv("XEMU_SSE_SELFTEST")) {
+        return;
+    }
+    typedef void (*fn)(CPUX86State *, ZMMReg *, ZMMReg *, ZMMReg *);
+    static const struct { const char *n; fn f; } ops[] = {
+        { "addps", helper_addps_xmm }, { "subps", helper_subps_xmm },
+        { "mulps", helper_mulps_xmm }, { "divps", helper_divps_xmm },
+        { "minps", helper_minps_xmm }, { "maxps", helper_maxps_xmm },
+        { "addss", helper_addss }, { "subss", helper_subss },
+        { "mulss", helper_mulss }, { "divss", helper_divss },
+        { "minss", helper_minss }, { "maxss", helper_maxss },
+    };
+    static const uint32_t ctrls[] = { 0x1f80, 0x3f80, 0x5f80, 0x7f80,
+                                      0x9f80, 0x1fc0, 0x9fc0 };
+    CPUX86State *env = g_new0(CPUX86State, 1);
+    cpu_init_fp_statuses(env);
+    uint64_t st = 0x9e3779b97f4a7c15ull;
+    long n = 0, bad_val = 0, bad_flag = 0, cnt_nan = 0, cnt_daz = 0;
+    for (int o = 0; o < ARRAY_SIZE(ops); o++) {
+        long ob = 0;
+        for (int c = 0; c < ARRAY_SIZE(ctrls); c++) {
+            for (int it = 0; it < 200000; it++) {
+                ZMMReg v = {}, s = {}, d1 = {}, d2 = {};
+                for (int k = 0; k < 4; k++) {
+                    v.ZMM_L(k) = selftest_rand_f32(&st);
+                    s.ZMM_L(k) = selftest_rand_f32(&st);
+                }
+                uint32_t mx[2];
+                for (int m = 0; m < 2; m++) {
+                    g_config.perf.hard_fpu = m;
+                    env->mxcsr = ctrls[c];
+                    update_mxcsr_status(env);
+                    ops[o].f(env, m ? &d2 : &d1, &v, &s);
+                    update_mxcsr_from_sse_status(env);
+                    mx[m] = env->mxcsr & 0x3f;
+                }
+                n++;
+                int lanes = ops[o].n[3] == 'p' ? 4 : 1;
+                for (int k = 0; k < 4; k++) {
+                    if (d1.ZMM_L(k) == d2.ZMM_L(k)) {
+                        continue;
+                    }
+                    uint32_t a = v.ZMM_L(k), b = s.ZMM_L(k);
+                    bool nan = k < lanes && (((a & 0x7fffffff) > 0x7f800000) ||
+                                             ((b & 0x7fffffff) > 0x7f800000));
+                    bool den = (ctrls[c] & 0x40) && k < lanes &&
+                               (!(a & 0x7f800000) || !(b & 0x7f800000));
+                    if (nan) {
+                        cnt_nan++;
+                    } else if (den) {
+                        cnt_daz++;
+                    } else {
+                        if (ob++ < 4) {
+                            fprintf(stderr, "%s ctrl=%04x lane%d v=%08x "
+                                    "s=%08x soft=%08x native=%08x\n",
+                                    ops[o].n, ctrls[c], k, a, b, d1.ZMM_L(k),
+                                    d2.ZMM_L(k));
+                        }
+                        bad_val++;
+                    }
+                }
+                if (mx[0] != mx[1]) {
+                    if (bad_flag++ < 10) {
+                        fprintf(stderr, "%s ctrl=%04x flags soft=%02x "
+                                "native=%02x\n", ops[o].n, ctrls[c], mx[0],
+                                mx[1]);
+                    }
+                }
+            }
+        }
+        fprintf(stderr, "%s: %ld value mismatches\n", ops[o].n, ob);
+    }
+    fprintf(stderr, "sse selftest: %ld cases, %ld unexplained value "
+            "mismatches, %ld flag mismatches, %ld NaN-propagation, "
+            "%ld DAZ-operand\n", n, bad_val, bad_flag, cnt_nan, cnt_daz);
+    exit(0);
+}
 #endif
