@@ -37,6 +37,24 @@ void nv2a_profile_increment(void)
         ts = now;
         frame_count = 0;
     }
+
+    /* molly-perf: XEMU_FPS_LOG=1 prints guest frame rate once per second */
+    static int log_enabled = -1;
+    if (log_enabled < 0) {
+        log_enabled = getenv("XEMU_FPS_LOG") != NULL;
+    }
+    if (log_enabled) {
+        static int64_t log_ts = 0, log_count = 0;
+        log_count++;
+        if (now - log_ts >= 1000000) {
+            if (log_ts) {
+                fprintf(stderr, "guest_fps %.2f\n",
+                        log_count * 1000000.0 / (now - log_ts));
+            }
+            log_ts = now;
+            log_count = 0;
+        }
+    }
 }
 
 void nv2a_profile_flip_stall(void)
