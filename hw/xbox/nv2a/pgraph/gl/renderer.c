@@ -102,7 +102,14 @@ static void pgraph_gl_finalize(NV2AState *d)
 static void pgraph_gl_flip_stall(NV2AState *d)
 {
     NV2A_GL_DFRAME_TERMINATOR();
-    glFinish();
+    /*
+     * molly-perf: no glFinish here. It drained the GPU on every guest flip
+     * while holding pg->lock, serializing CPU and GPU work and stalling the
+     * vCPU on PGRAPH MMIO. pgraph_gl_sync already waits for queued work
+     * before the display context samples the framebuffer; just make sure
+     * the commands are submitted.
+     */
+    glFlush();
 }
 
 static void pgraph_gl_flush(NV2AState *d)

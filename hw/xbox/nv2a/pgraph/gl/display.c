@@ -364,15 +364,6 @@ static void render_display(NV2AState *d, SurfaceBinding *surface)
         GL_TEXTURE_2D, 0, 0);
 }
 
-static void gl_fence(void)
-{
-    GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-    int result = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT,
-                                         (GLuint64)(5000000000));
-    assert(result == GL_CONDITION_SATISFIED || result == GL_ALREADY_SIGNALED);
-    glDeleteSync(fence);
-}
-
 void pgraph_gl_sync(NV2AState *d)
 {
     VGADisplayParams vga_display_params;
@@ -386,15 +377,31 @@ void pgraph_gl_sync(NV2AState *d)
 
     /* FIXME: Sanity check surface dimensions */
 
-    /* Wait for queued commands to complete */
+    /*
+     * Order queued render-context commands before the display draw on the
+     * GPU instead of draining them from the CPU: a client-side wait here
+     * blocked the FIFO thread (holding pg->lock) and kept the GPU idle
+     * enough that it never clocked up.
+     */
     pgraph_gl_upload_surface_data(d, surface, !tcg_enabled());
-    gl_fence();
+    GLsync render_done = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
     ASSERT_NO_GL_ERROR();
 
     /* Render framebuffer in display context */
     glo_set_current(g_nv2a_context_display);
+    glWaitSync(render_done, 0, GL_TIMEOUT_IGNORED);
+    glDeleteSync(render_done);
     render_display(d, surface);
-    gl_fence();
+    /*
+     * The UI thread waits on this GPU-side before sampling the display
+     * buffer (see pgraph_gl_get_framebuffer_surface) rather than this
+     * thread blocking on it with pg->lock held.
+     */
+    PGRAPHGLState *r = d->pgraph.gl_renderer_state;
+    assert(!r->display_fence);
+    r->display_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
     ASSERT_NO_GL_ERROR();
 
     /* Switch back to original context */
@@ -436,6 +443,12 @@ int pgraph_gl_get_framebuffer_surface(NV2AState *d)
     pfifo_kick(d);
     qemu_mutex_unlock(&d->pfifo.lock);
     qemu_event_wait(&d->pgraph.sync_complete);
+
+    if (r->display_fence) {
+        glWaitSync(r->display_fence, 0, GL_TIMEOUT_IGNORED);
+        glDeleteSync(r->display_fence);
+        r->display_fence = 0;
+    }
 
     return r->gl_display_buffer;
 }

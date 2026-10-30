@@ -185,6 +185,7 @@ typedef struct QueryReport {
 typedef struct PGRAPHGLState {
     GLuint gl_framebuffer;
     GLuint gl_display_buffer;
+    GLsync display_fence;
     GLint gl_display_buffer_internal_format;
     GLsizei gl_display_buffer_width;
     GLsizei gl_display_buffer_height;
